@@ -7,10 +7,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-// 假设的模块加载基地址
-// 实际上内核会动态分配这个地址，这里为了演示设为 0xbf000000
-#define MODULE_LOAD_BASE 0xbf000000
-// ARM32 重定位类型定义
+
 #define R_ARM_NONE     0
 #define R_ARM_ABS32    2
 #define R_ARM_REL32    3
@@ -18,12 +15,7 @@
 #ifndef R_ARM_THM_JUMP24
 #define R_ARM_THM_JUMP24 30
 #endif
-// 辅助宏
-// #define ELF32_R_SYM(info)  ((info) >> 8)
-// #define ELF32_R_TYPE(info) ((uint8_t)(info))
-/**
- * 查找指定名称的 Section Header
- */
+
 static Elf32_Shdr *find_section_header(char *shstrtab, Elf32_Ehdr *ehdr, const char *name)
 {
     Elf32_Shdr *shdrs = (Elf32_Shdr *)((char *)ehdr + ehdr->e_shoff);
@@ -49,6 +41,7 @@ static int sign_extend32(uint32_t value, int index)
     return (int)(value << shift) >> shift;
 }
 
+// copy from linux kernel
 static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym, unsigned long loc)
 {
     u32 upper, lower, sign, j1, j2;
@@ -90,35 +83,28 @@ static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym,
     *(u16 *)(loc + 2) = __opcode_to_mem_thumb16(lower);
 }
 
-/**
- * 执行静态重定位的核心函数
- */
-void apply_relocations(Elf32_Ehdr *ehdr)
+static void apply_relocations(Elf32_Ehdr *ehdr, const char *text_sec_name)
 {
     Elf32_Shdr *shdrs = (Elf32_Shdr *)((char *)ehdr + ehdr->e_shoff);
     // 1. 获取 Section Header String Table
     Elf32_Shdr *shstrtab_sec = &shdrs[ehdr->e_shstrndx];
     char *shstrtab = (char *)ehdr + shstrtab_sec->sh_offset;
-    // 2. 查找关键段
-    Elf32_Shdr *text_sec = find_section_header(shstrtab, ehdr, ".text");
-    Elf32_Shdr *rel_text_sec = find_section_header(shstrtab, ehdr, ".rel.text");
+
+    char rel_sec_name[128] = {0};
+    snprintf(rel_sec_name, sizeof(rel_sec_name), ".rel%s", text_sec_name);
+
+    Elf32_Shdr *text_sec = find_section_header(shstrtab, ehdr, text_sec_name);
+    Elf32_Shdr *rel_text_sec = find_section_header(shstrtab, ehdr, rel_sec_name);
     Elf32_Shdr *symtab_sec = find_section_header(shstrtab, ehdr, ".symtab");
-    Elf32_Shdr *strtab_sec = &shdrs[symtab_sec->sh_link];
-    char *strtab = (char *)ehdr + strtab_sec->sh_offset;
 
     if (!rel_text_sec || !symtab_sec) {
         printf("Missing critical sections (.data, .rel.data, .symtab). Exiting.\n");
         return;
     }
 
-    // 3. 准备指针
-    // .rel.text 中的重定位项数组
     Elf32_Rel *rels = (Elf32_Rel *)((char *)ehdr + rel_text_sec->sh_offset);
     int rel_count = rel_text_sec->sh_size / sizeof(Elf32_Rel);
-    // 符号表
     Elf32_Sym *symtab = (Elf32_Sym *)((char *)ehdr + symtab_sec->sh_offset);
-    printf("Found %d relocations in .rel.text.\n", rel_count);
-    // 4. 遍历重定位项
     for (int i = 0; i < rel_count; i++) {
         Elf32_Rel *rel = &rels[i];
         uint32_t r_info = rel->r_info;
@@ -129,13 +115,11 @@ void apply_relocations(Elf32_Ehdr *ehdr)
         if (sym->st_value == 0 || sym->st_size == 0) {
             continue;
         }
-        // 5. 根据 ARM32 类型进行重定位计算
+
         if (rel_type == R_ARM_THM_CALL || rel_type == R_ARM_THM_JUMP24) {
             uint32_t r_offset = rel->r_offset;
             uint32_t *patch_loc = (uint32_t *)((char *)ehdr + text_sec->sh_offset + r_offset);
-            uint32_t old_val = *patch_loc;
             relocate_thumb(ehdr, text_sec, sym, (unsigned long)patch_loc);
-            printf("relocate %s %x -> %x\n", sym->st_name + strtab, old_val, *patch_loc);
         }
     }
 }
@@ -152,11 +136,11 @@ int main(int argc, char *argv[])
         perror("open");
         return 1;
     }
-    // 获取文件大小
+
     struct stat st;
     fstat(fd, &st);
     size_t file_size = st.st_size;
-    // 将 ELF 文件映射到内存
+
     char *map_base = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map_base == MAP_FAILED) {
         perror("mmap");
@@ -171,15 +155,13 @@ int main(int argc, char *argv[])
         close(fd);
         return 1;
     }
-    printf("Applying static relocations for ARM32...\n");
-    printf("Assuming Load Base Address: 0x%x\n\n", MODULE_LOAD_BASE);
-    // 执行重定位
-    apply_relocations(ehdr);
-    // 清理
+
+    apply_relocations(ehdr, ".text");
+    apply_relocations(ehdr, ".init.text");
+    apply_relocations(ehdr, ".exit.text");
 
     msync(map_base, file_size, MS_SYNC);  // 将修改写回文件
     munmap(map_base, file_size);
     close(fd);
-    printf("\nDone. Relocations applied and file updated.\n");
     return 0;
 }
