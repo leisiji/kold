@@ -15,6 +15,9 @@
 #define R_ARM_ABS32    2
 #define R_ARM_REL32    3
 #define R_ARM_THM_CALL 10
+#ifndef R_ARM_THM_JUMP24
+#define R_ARM_THM_JUMP24 30
+#endif
 // 辅助宏
 // #define ELF32_R_SYM(info)  ((info) >> 8)
 // #define ELF32_R_TYPE(info) ((uint8_t)(info))
@@ -33,6 +36,60 @@ static Elf32_Shdr *find_section_header(char *shstrtab, Elf32_Ehdr *ehdr, const c
     return NULL;
 }
 
+#define __mem_to_opcode_thumb16(x) (x)
+#define __opcode_to_mem_thumb16(x) (x)
+
+#define u32 uint32_t
+#define s32 int
+#define u16 uint16_t
+
+static int sign_extend32(uint32_t value, int index)
+{
+    uint8_t shift = 31 - index;
+    return (int)(value << shift) >> shift;
+}
+
+static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym, unsigned long loc)
+{
+    u32 upper, lower, sign, j1, j2;
+    s32 offset;
+
+    upper = __mem_to_opcode_thumb16(*(u16 *)loc);
+    lower = __mem_to_opcode_thumb16(*(u16 *)(loc + 2));
+
+    /*
+     * 25 bit signed address range (Thumb-2 BL and B.W
+     * instructions):
+     *   S:I1:I2:imm10:imm11:0
+     * where:
+     *   S     = upper[10]   = offset[24]
+     *   I1    = ~(J1 ^ S)   = offset[23]
+     *   I2    = ~(J2 ^ S)   = offset[22]
+     *   imm10 = upper[9:0]  = offset[21:12]
+     *   imm11 = lower[10:0] = offset[11:1]
+     *   J1    = lower[13]
+     *   J2    = lower[11]
+     */
+    sign = (upper >> 10) & 1;
+    j1 = (lower >> 13) & 1;
+    j2 = (lower >> 11) & 1;
+    offset = (sign << 24) | ((~(j1 ^ sign) & 1) << 23) | ((~(j2 ^ sign) & 1) << 22) |
+             ((upper & 0x03ff) << 12) | ((lower & 0x07ff) << 1);
+    offset = sign_extend32(offset, 24);
+
+    uint32_t sym_addr = (uint32_t)(unsigned long long)ehdr + dstsec->sh_offset + sym->st_value;
+    offset += sym_addr - loc;
+
+    sign = (offset >> 24) & 1;
+    j1 = sign ^ (~(offset >> 23) & 1);
+    j2 = sign ^ (~(offset >> 22) & 1);
+    upper = (u16)((upper & 0xf800) | (sign << 10) | ((offset >> 12) & 0x03ff));
+    lower = (u16)((lower & 0xd000) | (j1 << 13) | (j2 << 11) | ((offset >> 1) & 0x07ff));
+
+    *(u16 *)loc = __opcode_to_mem_thumb16(upper);
+    *(u16 *)(loc + 2) = __opcode_to_mem_thumb16(lower);
+}
+
 /**
  * 执行静态重定位的核心函数
  */
@@ -43,6 +100,7 @@ void apply_relocations(Elf32_Ehdr *ehdr)
     Elf32_Shdr *shstrtab_sec = &shdrs[ehdr->e_shstrndx];
     char *shstrtab = (char *)ehdr + shstrtab_sec->sh_offset;
     // 2. 查找关键段
+    Elf32_Shdr *text_sec = find_section_header(shstrtab, ehdr, ".text");
     Elf32_Shdr *rel_text_sec = find_section_header(shstrtab, ehdr, ".rel.text");
     Elf32_Shdr *symtab_sec = find_section_header(shstrtab, ehdr, ".symtab");
     Elf32_Shdr *strtab_sec = &shdrs[symtab_sec->sh_link];
@@ -68,15 +126,16 @@ void apply_relocations(Elf32_Ehdr *ehdr)
         uint32_t rel_type = ELF32_R_TYPE(r_info);
         Elf32_Sym *sym = &symtab[sym_idx];
 
-        printf("sym %s %d %d %d\n", sym->st_name + strtab, ELF32_R_TYPE(r_info),
-               sym->st_value, sym->st_value);
         if (sym->st_value == 0 || sym->st_size == 0) {
             continue;
         }
         // 5. 根据 ARM32 类型进行重定位计算
         if (rel_type == R_ARM_THM_CALL || rel_type == R_ARM_THM_JUMP24) {
-            uint8_t new_bind = STB_LOCAL;
-            sym->st_info = (new_bind << 4) | (sym->st_info & 0x0F);
+            uint32_t r_offset = rel->r_offset;
+            uint32_t *patch_loc = (uint32_t *)((char *)ehdr + text_sec->sh_offset + r_offset);
+            uint32_t old_val = *patch_loc;
+            relocate_thumb(ehdr, text_sec, sym, (unsigned long)patch_loc);
+            printf("relocate %s %x -> %x\n", sym->st_name + strtab, old_val, *patch_loc);
         }
     }
 }
