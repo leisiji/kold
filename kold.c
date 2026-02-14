@@ -49,6 +49,9 @@ static Elf32_Shdr *find_section_header(char *shstrtab, Elf32_Ehdr *ehdr, const c
 #define __mem_to_opcode_thumb16(x) (x)
 #define __opcode_to_mem_thumb16(x) (x)
 
+#define __opcode_to_mem_arm(x) (u32)(x)
+#define __mem_to_opcode_arm(x) (u32)(x)
+
 static int sign_extend32(uint32_t value, int index)
 {
     uint8_t shift = 31 - index;
@@ -56,7 +59,8 @@ static int sign_extend32(uint32_t value, int index)
 }
 
 // copy from linux kernel
-static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym, unsigned long loc)
+static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, uint32_t sym_addr,
+                           unsigned long loc)
 {
     u32 upper, lower, sign, j1, j2;
     s32 offset;
@@ -71,7 +75,6 @@ static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym,
              ((upper & 0x03ff) << 12) | ((lower & 0x07ff) << 1);
     offset = sign_extend32(offset, 24);
 
-    uint32_t sym_addr = (uint32_t)(unsigned long long)ehdr + dstsec->sh_offset + sym->st_value;
     offset += sym_addr - loc;
 
     sign = (offset >> 24) & 1;
@@ -82,6 +85,24 @@ static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, Elf32_Sym *sym,
 
     *(u16 *)loc = __opcode_to_mem_thumb16(upper);
     *(u16 *)(loc + 2) = __opcode_to_mem_thumb16(lower);
+}
+
+static void relocate_arm_call(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, uint32_t sym_addr,
+                              unsigned long loc)
+{
+    s32 offset;
+
+    offset = __mem_to_opcode_arm(*(u32 *)loc);
+    offset = (offset & 0x00ffffff) << 2;
+    offset = sign_extend32(offset, 25);
+
+    offset += sym_addr - loc;
+
+    offset >>= 2;
+    offset &= 0x00ffffff;
+
+    *(u32 *)loc &= __opcode_to_mem_arm(0xff000000);
+    *(u32 *)loc |= __opcode_to_mem_arm(offset);
 }
 
 static void add_relocated_entry(int rel_sec_index, int entry_index)
@@ -450,10 +471,16 @@ static void apply_relocations(Elf32_Ehdr *ehdr, const char *text_sec_name, int r
             continue;
         }
 
+        uint32_t r_offset = rel->r_offset;
+        uint32_t *patch_loc = (uint32_t *)((char *)ehdr + text_sec->sh_offset + r_offset);
+        uint32_t sym_addr =
+            (uint32_t)(unsigned long long)ehdr + text_sec->sh_offset + sym->st_value;
+
         if (rel_type == R_ARM_THM_CALL || rel_type == R_ARM_THM_JUMP24) {
-            uint32_t r_offset = rel->r_offset;
-            uint32_t *patch_loc = (uint32_t *)((char *)ehdr + text_sec->sh_offset + r_offset);
-            relocate_thumb(ehdr, text_sec, sym, (unsigned long)patch_loc);
+            relocate_thumb(ehdr, text_sec, sym_addr, (unsigned long)patch_loc);
+            add_relocated_entry(rel_sec_index, i);
+        } else if (rel_type == R_ARM_CALL || rel_type == R_ARM_JUMP24) {
+            relocate_arm_call(ehdr, text_sec, sym_addr, (unsigned long)patch_loc);
             add_relocated_entry(rel_sec_index, i);
         }
     }
