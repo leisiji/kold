@@ -520,22 +520,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    char temp_file[256];
-    int use_temp = 0;
-
-    // If input and output are the same file, use a temporary file
-    if (strcmp(filename, output_file) == 0) {
-        snprintf(temp_file, sizeof(temp_file), "%s.tmp.XXXXXX", filename);
-        int fd_temp = mkstemp(temp_file);
-        if (fd_temp < 0) {
-            perror("mkstemp");
-            return 1;
-        }
-        close(fd_temp);
-        use_temp = 1;
-        output_file = temp_file;
-    }
-
     // First open the file for processing and information collection
     int fd = open(filename, O_RDWR);
     if (fd < 0) {
@@ -547,10 +531,38 @@ int main(int argc, char *argv[])
     fstat(fd, &st);
     size_t file_size = st.st_size;
 
-    char *map_base = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map_base == MAP_FAILED) {
+    char *input_buf = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (input_buf == MAP_FAILED) {
         perror("mmap");
         close(fd);
+        return 1;
+    }
+
+    char temp_file[256];
+
+    snprintf(temp_file, sizeof(temp_file), "%s.tmp.XXXXXX", filename);
+    int fd_temp = mkstemp(temp_file);
+    if (fd_temp < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+    int bytes = 0;
+    while (bytes < file_size) {
+        int ret = write(fd_temp, input_buf + bytes, file_size - bytes);
+        if (ret < 0) {
+            perror("write failed\n");
+            break;
+        }
+        bytes += ret;
+    }
+    munmap(input_buf, file_size);
+    close(fd);
+    filename = temp_file;
+
+    char *map_base = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_temp, 0);
+    if (map_base == MAP_FAILED) {
+        perror("mmap");
+        close(fd_temp);
         return 1;
     }
 
@@ -559,7 +571,7 @@ int main(int argc, char *argv[])
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 || ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
         printf("Not a valid 32-bit ELF file.\n");
         munmap(map_base, file_size);
-        close(fd);
+        close(fd_temp);
         return 1;
     }
 
@@ -587,7 +599,7 @@ int main(int argc, char *argv[])
     printf("Total relocated entries: %d\n", relocated_count);
 
     munmap(map_base, file_size);
-    close(fd);
+    close(fd_temp);
 
     if (relocated_count == 0) {
         printf("No relocations processed, creating output file with same content.\n");
@@ -619,16 +631,7 @@ int main(int argc, char *argv[])
     // Create new ELF file
     int ret = create_new_elf(filename, output_file);
 
-    if (ret == 0 && use_temp) {
-        // Rename temporary file to final output file
-        if (rename(output_file, filename) != 0) {
-            perror("rename temp file");
-            ret = -1;
-        }
-    } else if (ret != 0 && use_temp) {
-        // Delete temporary file on failure
-        unlink(output_file);
-    }
+    unlink(filename);
 
     free(relocated_entries);
     relocated_entries = NULL;
