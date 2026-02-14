@@ -105,6 +105,65 @@ kold module.o -o module.o
 - `kold`: Compiled binary
 - `remove_unref_sym.sh`: Helper script to remove unreferenced symbols
 
-## License
+## Other ways to save ko size
 
-This tool is provided as-is for kernel development purposes.
+### gc-sections
+
+Because `CONFIG_LD_DEAD_CODE_DATA_ELIMINATION` only enables gc-sections in build of vmlinux, so we should add extra flags in kernel module build
+
+```make
+CFLAGS_MODULE := -ffunction-sections -fdata-sections
+LDSRIPT := $(PWD)/module.tmp.lds
+
+all: $(MKFS)
+	make -C $(KDIR) M=$(PWD) modules
+	rm *.ko
+    # the first build is to get EXPORT_SYMBOL, and collect it to the module.tmp.lds
+	cat $(PWD)/module.lds > $(LDSRIPT)
+	echo -e "SECTIONS {\n__ksymtab : {" >> $(LDSRIPT)
+	for i in $(shell cat $(PWD)/Module.symvers | awk '{print $$2}'); do echo "KEEP(*(___ksymtab+$${i}))" >> $(LDSRIPT); done
+	echo -e "}\n}" >> $(LDSRIPT)
+	make -C $(KDIR) M=$(PWD) ld=ld.lld LDFLAGS_MODULE="--gc-sections -T $(PWD)/module.tmp.lds -u init_module -u cleanup_module" modules
+```
+
+module.lds:
+
+```txt
+SECTIONS {
+    /DISCARD/ : {
+        *(.discard)
+        *(.discard.*)
+        *(.eh_frame)
+        *(.ARM.exidx) *(.ARM.exidx.*)
+        *(.ARM.extab) *(.ARM.extab.*)
+    }
+    .bss : {
+        *(.bss .bss.[0-9a-zA-Z_]*)
+        *(.bss..L*)
+    }
+    .data : {
+        *(.data .data.[0-9a-zA-Z_]*)
+        *(.data..L*)
+    }
+    .rodata : {
+        *(.rodata.._start)
+        *(.rodata .rodata.[0-9a-zA-Z_]*)
+        *(.rodata..L*)
+        *(.rodata.._end)
+    }
+    .text : {
+        *(.text.._start)
+        *(.text .text.[0-9a-zA-Z_]*)
+        *(.text.._end)
+    }
+    .modinfo : {
+        KEEP(*(.modinfo))
+    }
+    __param : {
+        KEEP(*(__param))
+    }
+    .pv_table : {
+        KEEP(*(.pv_table))
+    }
+}
+```
