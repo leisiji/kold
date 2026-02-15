@@ -126,6 +126,14 @@ all: $(MKFS)
 	make -C $(KDIR) M=$(PWD) ld=ld.lld LDFLAGS_MODULE="--gc-sections -T $(PWD)/module.tmp.lds -u init_module -u cleanup_module" modules
 ```
 
+**Note**: When `-ffunction-sections -fdata-sections` is enabled, ARM `$t` and `$d` symbols will increase and need to be removed using `llvm-objcopy`:
+
+```bash
+llvm-objcopy --strip-symbol="\$t" --strip-symbol="\$d" <input.ko> <output.ko>
+```
+
+Alternatively, using the `remove_unref_sym.sh` script will also remove these symbols.
+
 module.lds:
 
 ```txt
