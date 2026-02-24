@@ -60,8 +60,7 @@ static int sign_extend32(uint32_t value, int index)
 }
 
 // copy from linux kernel
-static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, uint32_t sym_addr,
-                           unsigned long loc)
+static void relocate_thumb(Elf32_Ehdr *ehdr, uint32_t sym_addr, unsigned long loc)
 {
     u32 upper, lower, sign, j1, j2;
     s32 offset;
@@ -88,8 +87,7 @@ static void relocate_thumb(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, uint32_t sym_ad
     *(u16 *)(loc + 2) = __opcode_to_mem_thumb16(lower);
 }
 
-static void relocate_arm_call(Elf32_Ehdr *ehdr, Elf32_Shdr *dstsec, uint32_t sym_addr,
-                              unsigned long loc)
+static void relocate_arm_call(Elf32_Ehdr *ehdr, uint32_t sym_addr, unsigned long loc)
 {
     s32 offset;
 
@@ -188,8 +186,7 @@ static int write_output_elf(Elf32_Ehdr *ehdr, size_t orig_file_size, const char 
 
     size_t new_file_size = orig_file_size - total_removed;
 
-    // Build offset adjustment map: for each byte position, how much to subtract
-    // We create a simple mapping based on section boundaries
+    // Build offset adjustment map: collect modified sections' end positions
     int num_adjusts = 0;
     OffsetAdjust *adjusts = malloc((ehdr->e_shnum + 1) * sizeof(OffsetAdjust));
     if (!adjusts) {
@@ -198,35 +195,32 @@ static int write_output_elf(Elf32_Ehdr *ehdr, size_t orig_file_size, const char 
         return -1;
     }
 
-    // Sort sections by offset to build adjustment map
-    int *sec_order = malloc(ehdr->e_shnum * sizeof(int));
+    // Collect adjustment points from modified sections
     for (int i = 0; i < ehdr->e_shnum; i++) {
-        sec_order[i] = i;
+        if (sec_removed[i] > 0) {
+            adjusts[num_adjusts].start = shdrs[i].sh_offset + shdrs[i].sh_size;
+            adjusts[num_adjusts].delta = sec_removed[i];
+            num_adjusts++;
+        }
     }
-    // Simple bubble sort by offset
-    for (int i = 0; i < ehdr->e_shnum - 1; i++) {
-        for (int j = i + 1; j < ehdr->e_shnum; j++) {
-            if (shdrs[sec_order[i]].sh_offset > shdrs[sec_order[j]].sh_offset) {
-                int tmp = sec_order[i];
-                sec_order[i] = sec_order[j];
-                sec_order[j] = tmp;
+
+    // Sort adjustment points by offset (simple bubble sort, num_adjusts is small)
+    for (int i = 0; i < num_adjusts - 1; i++) {
+        for (int j = i + 1; j < num_adjusts; j++) {
+            if (adjusts[i].start > adjusts[j].start) {
+                OffsetAdjust tmp = adjusts[i];
+                adjusts[i] = adjusts[j];
+                adjusts[j] = tmp;
             }
         }
     }
 
-    // Build adjustment points
-    uint32_t cumulative_delta = 0;
-    for (int i = 0; i < ehdr->e_shnum; i++) {
-        int sec_idx = sec_order[i];
-        if (sec_removed[sec_idx] > 0) {
-            // Adjustment starts after this section (at its end)
-            cumulative_delta += sec_removed[sec_idx];
-            adjusts[num_adjusts].start = shdrs[sec_idx].sh_offset + shdrs[sec_idx].sh_size;
-            adjusts[num_adjusts].delta = cumulative_delta;
-            num_adjusts++;
-        }
+    // Convert to cumulative deltas
+    uint32_t cumulative = 0;
+    for (int i = 0; i < num_adjusts; i++) {
+        cumulative += adjusts[i].delta;
+        adjusts[i].delta = cumulative;
     }
-    free(sec_order);
 
     // Allocate output buffer
     char *output_buf = calloc(1, new_file_size);
@@ -331,10 +325,10 @@ static void apply_relocations(Elf32_Ehdr *ehdr, const char *text_sec_name, int r
             (uint32_t)(unsigned long long)ehdr + text_sec->sh_offset + sym->st_value;
 
         if (rel_type == R_ARM_THM_CALL || rel_type == R_ARM_THM_JUMP24) {
-            relocate_thumb(ehdr, text_sec, sym_addr, (unsigned long)patch_loc);
+            relocate_thumb(ehdr, sym_addr, (unsigned long)patch_loc);
             add_relocated_entry(rel_sec_index, i);
         } else if (rel_type == R_ARM_CALL || rel_type == R_ARM_JUMP24) {
-            relocate_arm_call(ehdr, text_sec, sym_addr, (unsigned long)patch_loc);
+            relocate_arm_call(ehdr, sym_addr, (unsigned long)patch_loc);
             add_relocated_entry(rel_sec_index, i);
         }
     }
